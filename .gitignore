@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyCharm
+.idea/
+
+# 向量数据库
+chroma_db/
+
+# Word 临时文件
+~$*
+
+# 个人文档
+自学检验总结.docx
