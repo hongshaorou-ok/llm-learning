@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from openai import OpenAI
 from docx import Document
+from datetime import datetime
 import chromadb
 import uvicorn
 import pymupdf
@@ -28,7 +29,7 @@ def extract_docx_text(content: bytes) -> str:
 
 # ========== 1. 初始化客户端 ==========
 client = OpenAI(
-    api_key="你的 APIkey(根据你的大模型更改网站和思考模型)",
+    api_key="你的智谱APIkey",
     base_url="https://open.bigmodel.cn/api/paas/v4/"
 )
 
@@ -65,38 +66,100 @@ if COLLECTION_NAME in existing:
     print("已加载已有集合，跳过向量化")
 else:
     collection = chroma_client.create_collection(name=COLLECTION_NAME)
-
-    document = (
-                   "人工智能是计算机科学的一个分支，它企图了解智能的实质，并生产出一种新的能以人类智能相似的方式做出反应的智能机器。"
-                   "该领域的研究包括机器人、语言识别、图像识别、自然语言处理和专家系统等。人工智能从诞生以来，理论和技术日益成熟，"
-                   "应用领域也不断扩大。可以设想，未来人工智能带来的科技产品，将会是人类智慧的容器。人工智能可以对人的意识、思维的信息过程进行模拟。"
-                   "人工智能不是人的智能，但能像人那样思考、也可能超过人的智能。"
-               ) * 10
-
-    chunks = split_text(document)
-
-    embeddings_list = []
-    ids_list = []
-    for i, chunk in enumerate(chunks):
-        vec = get_embedding(chunk)
-        embeddings_list.append(vec)
-        ids_list.append(f"id_{i}")
-
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings_list,
-        ids=ids_list,
-        metadatas=[{"source": "default"} for _ in chunks]
-    )
-    print("首次构建完成，已存入磁盘")
+    print("已创建空集合,请通过/upload上传文档")
 
 
-# ========== 4. RAG 函数 ==========
+# ========= 工具函数  ============
+def get_current_time():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =======字典映射========
+func_map = {
+    "get_current_time": get_current_time
+}
+
+# =======工具描述========
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "获取当前日期和时间。当用户询问现在几点、今天几号等问题时调用。",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    }
+]
+
+
+# ========== 4.判断是否闲聊进行直接回答或者走RAG流程 ==========
 def get_answer(question: str) -> str:
+    # ========== 第一步：带 tools 调用大模型 ==========
+    messages = [{"role": "user", "content": question}]
+    response = client.chat.completions.create(
+        model="glm-4-flash",
+        messages=messages,
+        tools=tools,
+        temperature=0
+    )
+    msg = response.choices[0].message
+
+    # ========== 第二步：判断是否调工具 ==========
+    if msg.tool_calls:
+        # 调工具
+        messages.append(msg)
+        for tool_call in msg.tool_calls:
+            func_name = tool_call.function.name
+            if func_name in func_map:
+                result = func_map[func_name]()
+            else:
+                result = f"未知函数：{func_name}"
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": str(result)
+            })
+            # 再次调用大模型，生成最终回答
+        final = client.chat.completions.create(
+            model="glm-4-flash",
+            messages=messages,
+            temperature=0.3
+        )
+        return final.choices[0].message.content
+
+    # ========== 第三步：不调工具，走意图判断 ==========
+    intent_prompt = f"""请判断下面这句话属于哪类，只回答一个词：闲聊 或 知识。
+    
+用户输入: {question}
+"""
+    intent_resp = client.chat.completions.create(
+        model="glm-4-flash",
+        messages=[{"role": "user", "content": intent_prompt}],
+        temperature=0
+    )
+    intent = intent_resp.choices[0].message.content.strip()
+    # 第二步:闲聊分支,直接回答
+    if "闲聊" in intent:
+        chat_response = client.chat.completions.create(
+            model="glm-4-flash",
+            messages=[
+                {"role": "system", "content": "你是一个友好的客服助手，请用自然、亲切的语气回答用户。"},
+                {"role": "user", "content": question}
+            ],
+            temperature=0.7
+        )
+        return chat_response.choices[0].message.content
+
+    # 第三步：知识分支，走 RAG
+
     question_vec = get_embedding(question)
     results = collection.query(
         query_embeddings=[question_vec],
-        n_results=5
+        n_results=3
     )
     retrieved_docs = results["documents"][0]
     context = "\n\n".join(retrieved_docs)
@@ -111,7 +174,7 @@ def get_answer(question: str) -> str:
 
 请直接给出答案："""
 
-    response = client.chat.completions.create(
+    rag_resp = client.chat.completions.create(
         model="glm-4-flash",
         messages=[
             {"role": "system", "content": "你是严谨的知识助手，只根据给定的资料回答问题"},
@@ -119,7 +182,7 @@ def get_answer(question: str) -> str:
         ],
         temperature=0.2
     )
-    return response.choices[0].message.content
+    return rag_resp.choices[0].message.content
 
 
 # ========== 5. FastAPI ==========
@@ -161,7 +224,7 @@ async def upload_file(file: UploadFile = File(...)):
         if ext == ".txt":
             text = content.decode("utf-8")
         elif ext == ".pdf":
-            text = extract_docx_text(content)
+            text = extract_pdf_text(content)
         elif ext == ".docx":
             text = extract_docx_text(content)
     except Exception as e:
